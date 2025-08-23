@@ -4,7 +4,8 @@ import mlx.core as mx
 from .distributions import Distribution
 
 class Normal(Distribution):
-    def __init__(self, loc: float, scale: float): 
+    # Defaults to the standard normal distribution N(0,1)
+    def __init__(self, loc: float = 0.0, scale: float = 1.0): 
         self._loc = mx.array(loc)
         self._scale = mx.array(scale)
 
