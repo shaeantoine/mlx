@@ -91,9 +91,7 @@ CommandEncoder::CaptureContext::CaptureContext(CommandEncoder& enc) : enc(enc) {
 }
 
 CommandEncoder::CaptureContext::~CaptureContext() {
-  CHECK_CUDA_ERROR(cudaStreamEndCapture(enc.stream(), &graph));
-  std::unique_ptr<cudaGraph_t, void (*)(cudaGraph_t*)> graph_freer(
-      &graph, [](cudaGraph_t* p) { CHECK_CUDA_ERROR(cudaGraphDestroy(*p)); });
+  graph.end_capture(enc.stream());
   if (discard) {
     return;
   }
@@ -185,9 +183,10 @@ void CommandEncoder::insert_graph_dependencies(std::vector<GraphNode> nodes) {
 }
 
 CommandEncoder::CommandEncoder(Device& d)
-    : device_(d), stream_(d), graph_cache_(cuda_graph_cache_size()) {
-  CHECK_CUDA_ERROR(cudaGraphCreate(&graph_, 0));
-}
+    : device_(d),
+      stream_(d),
+      graph_(d),
+      graph_cache_(cuda_graph_cache_size()) {}
 
 void CommandEncoder::add_completed_handler(std::function<void()> task) {
   worker_.add_task(std::move(task));
@@ -270,7 +269,13 @@ void CommandEncoder::commit() {
   if (node_count_ > 0) {
     if (!from_nodes_.empty()) {
       CHECK_CUDA_ERROR(cudaGraphAddDependencies(
-          graph_, from_nodes_.data(), to_nodes_.data(), from_nodes_.size()));
+          graph_,
+          from_nodes_.data(),
+          to_nodes_.data(),
+#if CUDART_VERSION >= 13000
+          nullptr, // edgeData
+#endif // CUDART_VERSION >= 13000
+          from_nodes_.size()));
     }
 
     graph_key_ += ".";
@@ -311,8 +316,7 @@ void CommandEncoder::commit() {
     to_nodes_.clear();
     graph_key_.clear();
     node_map_.clear();
-    CHECK_CUDA_ERROR(cudaGraphDestroy(graph_));
-    CHECK_CUDA_ERROR(cudaGraphCreate(&graph_, 0));
+    graph_ = CudaGraph(device_);
   }
 
   // Put completion handlers in a batch.
