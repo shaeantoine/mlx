@@ -25,5 +25,23 @@ class TestDistributionNormal(mlx_tests.MLXTestCase):
         self.assertEqual(norm._loc.item(), 1.0)
         self.assertEqual(norm._scale.item(), 2.0)
 
+    def test_parameter_validation(self):
+        # Test protections for incorrect parameters
+        dist.Normal(loc=0.0, scale=0.1)
+        dist.Normal(loc=0.0, scale=1e-6)
+
+        with self.assertRaises(ValueError):
+            dist.Normal(loc=0.0, scale=0.0)
+        
+        with self.assertRaises(ValueError):
+            dist.Normal(loc=0.0, scale=-1.0)
+        
+        with self.assertRaises(ValueError):
+            dist.Normal(loc=0.0, scale=mx.array([-1.0, 1.0]))
+            
+        with self.assertRaises(ValueError):
+            dist.Normal(loc=mx.array([1.0, 2.0]), scale=1.0)
+        
+        
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()
