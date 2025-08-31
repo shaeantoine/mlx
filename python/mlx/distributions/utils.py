@@ -11,14 +11,28 @@ from abc import ABC, abstractmethod
 import warnings
 
 
-class ValidationLevel(Enum):
-    """Validation strictness levels."""
-    OFF = 0          # No validation
-    BASIC = 1        # Type checking only
-    STANDARD = 2     # Standard constraints
-    STRICT = 3       # All constraints + statistical tests
-    DEBUG = 4        # Everything + detailed debugging info
+@dataclass(frozen=True)
+class CheckResult: 
+    ok: mx.array                   # shape () boolean
+    violations: mx.array | None    # boolean mask (same shape as value) or None
+    summary: Dict[str, mx.array]   # small scalars/arrays
 
+class Constraint: 
+    def check(self, value: mx.array) -> CheckResult:
+        raise NotImplementedError
+    
+    def describe(self) -> str:
+        raise NotImplementedError
+    
+    def error_message(self, param_name: str) -> str: 
+        raise NotImplementedError
+    
+    def __call__(self, value: mx.array) -> CheckResult: 
+        return self.check(value)
+    
+    def __str__(self):
+        return self.describe()
+    
 
 class DistributionValidationError(ValueError):
     """Enhanced exception for distribution parameter validation errors."""
@@ -45,22 +59,97 @@ class DistributionValidationError(ValueError):
             for suggestion in self.suggestions:
                 print(f"   • {suggestion}")
     
-    def suggest_fix(self):
-        """Provide automatic fix suggestions."""
-        if not self.suggestions:
-            print("No automatic suggestions available")
-        else:
-            print("Try these fixes:")
-            for i, suggestion in enumerate(self.suggestions, 1):
-                print(f"{i}. {suggestion}")
+@dataclass(frozen=True)
+class Scalar(Constraint):
+    def check(self, value: mx.array) -> CheckResult: 
+        ok = mx.array(value.ndim == 0)
+        return CheckResult(ok=ok, violations=None, summary={"ndim": mx.array(value.ndim)})
+    
+    def describe(self) -> str:
+        return "scalar"
+    
+    def error_message(self, param_name: str) -> str:
+        return f"Parameter '{param_name}' must be scalar"
+
+@dataclass(frozen=True)
+class Positive(Constraint):
+    min_value: float = 0.0
+    def check(self, value: mx.array) -> CheckResult:
+        mask = value > self.min_value
+        ok = mx.all(mask)
+        summary = {"min": mx.min(value), "num_bad": mx.size(value) - mx.sum(mask)}
+        return CheckResult(ok=ok, violations=~mask, summary=summary)
+    
+    def describe(self) -> str:
+        return "positive ( > 0.0)" 
+    
+    def error_message(self, param_name: str) -> str:
+        return f"Parameter '{param_name}' must be {self.describe()}"
+
+@dataclass(frozen=True)
+class Interval(Constraint):
+    lower: float = -math.inf
+    upper: float = math.inf
+    lower_inclusive: bool = True
+    upper_inclusive: bool = True
+
+    def __post_init__(self):
+        if not (self.lower < self.upper):
+            raise ValueError(f"Invalid interval: lower ({self.lower}) must be < upper ({self.upper})")
+
+    def check(self, value: mx.array) -> CheckResult:
+        low = (value >= self.lower) if self.lower_inclusive else (value > self.lower)
+        high = (value <= self.upper) if self.upper_inclusive else (value < self.upper)
+        mask = low & high
+        ok = mx.all(mask)
+        num_bad = mx.size(value) - mx.sum(mask)
+        return CheckResult(ok=ok, violations=~mask, summary={"num_bad": num_bad})
+
+    def describe(self) -> str:
+        lb, ub = ("[", "]") if self.lower_inclusive else ("(", ")")
+        if not self.upper_inclusive:
+            ub = ")"
+        return f"in {lb}{self.lower}, {self.upper}{ub}"
+
+    def error_message(self, param_name: str) -> str:
+        return f"Parameter '{param_name}' must be {self.describe()}"
+
+@dataclass(frozen=True)
+class Integer(Constraint):
+    def check(self, value: mx.array) -> CheckResult:
+        is_int_dtype = value.dtype in (mx.int8, mx.int16, mx.int32, mx.int64, getattr(mx, 'uint32', mx.int32))
+        if is_int_dtype:
+            ok = mx.array(True)
+            return CheckResult(ok=ok, violations=None, summary={})
+
+    def describe(self) -> str:
+        return "integer values"
+    
+    def error_message(self, param_name: str) -> str:
+        return f"Parameter '{param_name}' must be integer-valued"
+
+# Predefined constraints
+positive = Positive()
+strictly_positive = Positive(min_value=1e-8)
+non_negative = Interval(0.0, math.inf, True, True)
+real = Real()
+scalar = Scalar()
+unit_interval = Interval(0.0, 1.0, True, True)
+probability = unit_interval
 
 
 @dataclass
 class ValidationResult:
-    """Result of parameter validation."""
-    value: mx.array
-    warnings: List[str]
-    debug_info: Dict[str, Any]
+    value: Any
+    warnings: List[str] = field(default_factory=list)
+
+
+class DistributionValidationError(ValueError):
+    def __init__(self, message: str, param_name: str | None = None,
+                 constraint: 'Constraint' | None = None):
+        super().__init__(message)
+        self.param_name = param_name
+        self.constaint = constraint
     
     def __post_init__(self):
         if self.warnings:
@@ -128,68 +217,22 @@ class PositiveConstraint(Constraint):
         return f"positive(>{self.min_value})"
 
 
-class IntervalConstraint(Constraint):
-    """Enhanced interval constraint with better error handling."""
-    
-    def __init__(self, lower: float = -math.inf, upper: float = math.inf, 
-                 lower_inclusive: bool = True, upper_inclusive: bool = True):
-        self.lower = lower
-        self.upper = upper
-        self.lower_inclusive = lower_inclusive
-        self.upper_inclusive = upper_inclusive
-        
-        if lower >= upper:
-            raise ValueError(f"Invalid interval: lower ({lower}) >= upper ({upper})")
-    
-    def check(self, value: mx.array) -> bool:
-        if self.lower_inclusive:
-            lower_ok = mx.all(value >= self.lower).item()
-        else:
-            lower_ok = mx.all(value > self.lower).item()
-        
-        if self.upper_inclusive:
-            upper_ok = mx.all(value <= self.upper).item()
-        else:
-            upper_ok = mx.all(value < self.upper).item()
-        
-        return lower_ok and upper_ok
-    
-    def error_message(self, param_name: str, actual_value: Any = None) -> str:
-        lower_bracket = "[" if self.lower_inclusive else "("
-        upper_bracket = "]" if self.upper_inclusive else ")"
-        interval_str = f"{lower_bracket}{self.lower}, {self.upper}{upper_bracket}"
-        
-        if actual_value is not None:
-            return f"Parameter '{param_name}' must be in interval {interval_str} (got {actual_value})"
-        return f"Parameter '{param_name}' must be in interval {interval_str}"
-    
-    def suggest_fix(self, param_name: str, actual_value: Any = None) -> List[str]:
-        suggestions = []
-        mid_point = (self.lower + self.upper) / 2 if not math.isinf(self.lower) and not math.isinf(self.upper) else 0.5
-        suggestions.append(f"Try {param_name}={mid_point}")
-        
-        if actual_value is not None:
-            try:
-                val = actual_value.item() if hasattr(actual_value, 'item') else float(actual_value)
-                if val < self.lower:
-                    suggestions.append(f"Increase value to at least {self.lower}")
-                elif val > self.upper:
-                    suggestions.append(f"Decrease value to at most {self.upper}")
-            except:
-                pass
-        
-        return suggestions
-    
-    def debug_info(self, value: mx.array) -> Dict[str, Any]:
-        info = super().debug_info(value)
-        info.update({
-            "interval": f"{self.lower} to {self.upper}",
-            "actual_min": float(mx.min(value).item()),
-            "actual_max": float(mx.max(value).item()),
-            "violations_lower": int(mx.sum(value < self.lower).item()) if not math.isinf(self.lower) else 0,
-            "violations_upper": int(mx.sum(value > self.upper).item()) if not math.isinf(self.upper) else 0,
-        })
-        return info
+        # Per-parameter constraints
+        for name, x in arrays.items():
+            res_warnings: List[str] = []
+            constraint = self._param_constraints.get(name)
+            if not isinstance(x, mx.array):
+                raise DistributionValidationError("Expected mx.array", param_name=name)
+            
+            constraint_res = constraint.check(x)
+            if not bool(mx.asarray(constraint_res.ok).item()):
+                raise DistributionValidationError(
+                    constraint.error_message(name,
+                                    self._summarize(x)),
+                                    param_name=name,
+                                    constraint=constraint)
+            res_warnings.append(f"{name}: {constraint.describe()} ok")
+            results[name] = ValidationResult(x, res_warnings)
 
 
 class ScalarConstraint(Constraint):
@@ -224,257 +267,17 @@ class ScalarConstraint(Constraint):
     def __str__(self):
         return "scalar"
 
-
-class CompoundConstraint(Constraint):
-    """Enhanced compound constraint with detailed error reporting."""
-    
-    def __init__(self, *constraints: Constraint):
-        if not constraints:
-            raise ValueError("CompoundConstraint requires at least one constraint")
-        self.constraints = constraints
-    
-    def check(self, value: mx.array) -> bool:
-        return all(constraint.check(value) for constraint in self.constraints)
-    
-    def error_message(self, param_name: str, actual_value: Any = None) -> str:
-        failed_constraints = [
-            constraint for constraint in self.constraints 
-            if not constraint.check(value) if 'value' in locals() else True
-        ]
-        
-        # If we have actual_value, find the first failing constraint properly
-        if actual_value is not None:
-            try:
-                value = mx.array(actual_value) if not isinstance(actual_value, mx.array) else actual_value
-                failed_constraints = [c for c in self.constraints if not c.check(value)]
-            except:
-                failed_constraints = self.constraints
-        
-        if failed_constraints:
-            return failed_constraints[0].error_message(param_name, actual_value)
-        return f"Parameter '{param_name}' violates compound constraint"
-    
-    def suggest_fix(self, param_name: str, actual_value: Any = None) -> List[str]:
-        all_suggestions = []
-        for constraint in self.constraints:
-            all_suggestions.extend(constraint.suggest_fix(param_name, actual_value))
-        return list(set(all_suggestions))  # Remove duplicates
-    
-    def debug_info(self, value: mx.array) -> Dict[str, Any]:
-        info = {"constraint_type": "compound", "sub_constraints": {}}
-        for i, constraint in enumerate(self.constraints):
-            info["sub_constraints"][f"constraint_{i}"] = constraint.debug_info(value)
-        return info
-    
-    def __str__(self):
-        return " AND ".join(str(c) for c in self.constraints)
-
-
-class RelationshipConstraint(Constraint):
-    """Constraint for relationships between multiple parameters."""
-    
-    def __init__(self, relationship_fn: Callable, description: str, 
-                 param_names: List[str] = None):
-        self.relationship_fn = relationship_fn
-        self.description = description
-        self.param_names = param_names or []
-    
-    def check(self, *values) -> bool:
-        """Check relationship between multiple values."""
-        try:
-            return self.relationship_fn(*values)
-        except:
-            return False
-    
-    def error_message(self, param_name: str, actual_value: Any = None) -> str:
-        return f"Parameter relationship violated: {self.description}"
-    
-    def suggest_fix(self, param_name: str, actual_value: Any = None) -> List[str]:
-        return [f"Ensure parameters satisfy: {self.description}"]
-    
-    def __str__(self):
-        return f"relationship({self.description})"
-
-
-# Pre-defined constraints with enhanced features
-positive = PositiveConstraint()
-strictly_positive = PositiveConstraint(min_value=1e-8)
-non_negative = IntervalConstraint(0.0, math.inf, True, False)
-real = IntervalConstraint(-math.inf, math.inf, True, True)
-scalar = ScalarConstraint()
-unit_interval = IntervalConstraint(0.0, 1.0, True, True)
-probability = unit_interval
-
-
-class AdvancedDistributionValidator:
-    """Enhanced validator with multiple validation levels and debugging."""
-    
-    def __init__(self, validation_level: ValidationLevel = ValidationLevel.STANDARD):
-        self.validation_level = validation_level
-        self._param_constraints: Dict[str, Constraint] = {}
-        self._param_transforms: Dict[str, Callable] = {}
-        self._relationship_constraints: List[Tuple[List[str], RelationshipConstraint]] = []
-        self._statistical_validators: Dict[str, Callable] = {}
-        
-        # Performance optimization: pre-compile validation for common cases
-        self._compiled_validators: Dict[str, Callable] = {}
-    
-    def set_validation_level(self, level: ValidationLevel):
-        """Change validation level dynamically."""
-        self.validation_level = level
-        self._compiled_validators.clear()  # Clear cache when level changes
-    
-    def register_constraint(self, param_name: str, constraint: Constraint):
-        """Register a constraint for a parameter."""
-        self._param_constraints[param_name] = constraint
-        # Clear compiled cache for this parameter
-        if param_name in self._compiled_validators:
-            del self._compiled_validators[param_name]
-    
-    def register_relationship(self, param_names: List[str], constraint: RelationshipConstraint):
-        """Register a constraint between multiple parameters."""
-        self._relationship_constraints.append((param_names, constraint))
-    
-    def register_statistical_validator(self, param_name: str, validator: Callable):
-        """Register statistical validation (for STRICT level)."""
-        self._statistical_validators[param_name] = validator
-    
-    def validate_param(self, param_name: str, value: Any, 
-                      context: Dict[str, Any] = None) -> ValidationResult:
-        """Enhanced parameter validation with detailed results."""
-        warnings_list = []
-        debug_info = {"param_name": param_name, "validation_level": self.validation_level.name}
-        
-        # Skip validation if OFF
-        if self.validation_level == ValidationLevel.OFF:
-            return ValidationResult(
-                value=self._ensure_array(value),
-                warnings=[],
-                debug_info=debug_info
-            )
-        
-        # Transform value
-        if param_name in self._param_transforms:
-            value = self._param_transforms[param_name](value)
-        else:
-            value = self._ensure_array(value)
-        
-        # Basic type checking
-        if self.validation_level >= ValidationLevel.BASIC:
-            if not isinstance(value, mx.array):
-                raise DistributionValidationError(
-                    f"Parameter '{param_name}' must be an MLX array",
-                    param_name, value, suggestions=["Convert to mx.array first"]
-                )
-        
-        # Standard constraint checking
-        if self.validation_level >= ValidationLevel.STANDARD:
-            if param_name in self._param_constraints:
-                constraint = self._param_constraints[param_name]
-                if not constraint.check(value):
-                    raise DistributionValidationError(
-                        constraint.error_message(param_name, value),
-                        param_name, value, constraint,
-                        constraint.suggest_fix(param_name, value)
-                    )
-                
-                if self.validation_level >= ValidationLevel.DEBUG:
-                    debug_info["constraint_debug"] = constraint.debug_info(value)
-        
-        # Strict statistical validation
-        if self.validation_level >= ValidationLevel.STRICT:
-            if param_name in self._statistical_validators:
-                try:
-                    stat_result = self._statistical_validators[param_name](value)
-                    if not stat_result.get("valid", True):
-                        warnings_list.append(f"Statistical validation warning for {param_name}: {stat_result.get('message', 'Unknown issue')}")
-                except Exception as e:
-                    warnings_list.append(f"Statistical validation failed for {param_name}: {e}")
-        
-        return ValidationResult(value, warnings_list, debug_info)
-    
-    def validate_params(self, **params) -> Dict[str, ValidationResult]:
-        """Validate multiple parameters with relationship checking."""
-        results = {}
-        validated_values = {}
-        
-        # Validate individual parameters
-        for name, value in params.items():
-            result = self.validate_param(name, value, context=params)
-            results[name] = result
-            validated_values[name] = result.value
-        
-        # Check relationships (if STANDARD or higher)
-        if self.validation_level >= ValidationLevel.STANDARD:
-            self._validate_relationships(validated_values)
-        
-        return results
-    
-    def _validate_relationships(self, validated_params: Dict[str, mx.array]):
-        """Validate relationships between parameters."""
-        for param_names, constraint in self._relationship_constraints:
-            if all(name in validated_params for name in param_names):
-                values = [validated_params[name] for name in param_names]
-                if not constraint.check(*values):
-                    param_desc = ", ".join(param_names)
-                    raise DistributionValidationError(
-                        f"Relationship constraint violated for parameters ({param_desc}): {constraint.description}",
-                        suggestions=constraint.suggest_fix("relationship", values)
-                    )
-    
     @staticmethod
-    def _ensure_array(value: Any, dtype: Optional[mx.Dtype] = None) -> mx.array:
-        """Enhanced array conversion with better error handling."""
-        if dtype is None:
-            dtype = mx.float32
-        
-        try:
-            if isinstance(value, mx.array):
-                return mx.astype(value, dtype) if value.dtype != dtype else value
-            else:
-                return mx.array(value, dtype=dtype)
-        except Exception as e:
-            raise DistributionValidationError(
-                f"Cannot convert value to mx.array: {e}",
-                suggestions=["Check that the value is numeric and finite"]
-            )
-    
-    def compile_validator(self, param_name: str) -> Callable:
-        """Compile validator for better performance."""
-        if param_name in self._compiled_validators:
-            return self._compiled_validators[param_name]
-        
-        # This is a placeholder for actual compilation
-        # In practice, you'd use mx.compile or similar
-        def compiled_validator(value):
-            return self.validate_param(param_name, value)
-        
-        self._compiled_validators[param_name] = compiled_validator
-        return compiled_validator
-    
-    def to_pytorch_constraints(self) -> Dict[str, Any]:
-        """Export constraints to PyTorch format."""
-        # Placeholder for cross-framework compatibility
-        pytorch_constraints = {}
-        for param_name, constraint in self._param_constraints.items():
-            if isinstance(constraint, PositiveConstraint):
-                pytorch_constraints[param_name] = "torch.distributions.constraints.positive"
-            # Add more mappings as needed
-        return pytorch_constraints
-    
-    def generate_documentation(self) -> str:
-        """Auto-generate parameter documentation."""
-        doc_lines = ["Parameters:"]
-        for param_name, constraint in self._param_constraints.items():
-            doc_lines.append(f"    {param_name}: {constraint}")
-        
-        if self._relationship_constraints:
-            doc_lines.append("\nConstraints:")
-            for param_names, constraint in self._relationship_constraints:
-                param_list = ", ".join(param_names)
-                doc_lines.append(f"    {param_list}: {constraint.description}")
-        
-        return "\n".join(doc_lines)
+    def _ensure_array(value: Any, dtype: mx.Dtype | None = None) -> mx.array:
+        if isinstance(value, mx.array):
+            return value if dtype is None else mx.astype(value, dtype)
+        if isinstance(value, bool):
+            return mx.array(value, dtype or mx.bool_)
+        if isinstance(value, int):
+            return mx.array(value, dtype or mx.int32)
+        if isinstance(value, float):
+            return mx.array(value, dtype or mx.float32)
+        return mx.array(value, dtype=dtype)
 
 
 # Enhanced factory functions
